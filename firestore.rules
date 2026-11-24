@@ -1,0 +1,105 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ---- helpers: roles come from the users/{uid} document, never from the browser ----
+    function signedIn() { return request.auth != null; }
+    function userDoc() { return /databases/$(database)/documents/users/$(request.auth.uid); }
+    function active() { return signedIn() && exists(userDoc()) && get(userDoc()).data.status == 'active'; }
+    function isAdmin() { return active() && get(userDoc()).data.role == 'admin'; }
+    function isTeacher() { return active() && get(userDoc()).data.role == 'teacher'; }
+    function mine(k) { return get(userDoc()).data.get(k, []); }
+    function str(v, max) { return v is string && v.size() > 0 && v.size() <= max; }
+
+    // Accounts. Self-signup can only create a PENDING TEACHER profile for yourself.
+    match /users/{uid} {
+      allow get: if signedIn() && (request.auth.uid == uid || isAdmin());
+      allow list: if isAdmin();
+      allow create: if isAdmin() || (signedIn() && request.auth.uid == uid
+        && request.resource.data.keys().hasOnly(['name', 'email', 'role', 'status', 'created_at'])
+        && request.resource.data.role == 'teacher' && request.resource.data.status == 'pending'
+        && request.resource.data.email == request.auth.token.email && str(request.resource.data.name, 100));
+      allow update: if isAdmin() && (request.auth.uid != uid
+        || (request.resource.data.role == resource.data.role && request.resource.data.status == resource.data.status));
+      allow delete: if isAdmin() && request.auth.uid != uid;
+    }
+
+    // Sections and subjects: admin manages; a teacher can read only the ones in their classes.
+    match /sections/{id} {
+      allow get: if isAdmin() || (isTeacher() && id in mine('section_ids'));
+      allow list: if isAdmin();
+      allow create, update: if isAdmin() && request.resource.data.keys().hasOnly(['name', 'course'])
+        && str(request.resource.data.name, 60) && request.resource.data.course is string;
+      allow delete: if isAdmin();
+    }
+    match /subjects/{id} {
+      allow get: if isAdmin() || (isTeacher() && id in mine('subject_ids'));
+      allow list: if isAdmin();
+      allow create, update: if isAdmin() && request.resource.data.keys().hasOnly(['code', 'name'])
+        && str(request.resource.data.code, 20) && str(request.resource.data.name, 100);
+      allow delete: if isAdmin();
+    }
+
+    // Classes (subject + section + teacher + schedule): admin writes; teacher reads only their own.
+    match /classes/{id} {
+      allow get, list: if isAdmin() || (isTeacher() && resource.data.teacher_id == request.auth.uid);
+      allow create, update: if isAdmin()
+        && request.resource.data.keys().hasOnly(['subject_id', 'section_id', 'teacher_id', 'days', 'start_time', 'end_time'])
+        && str(request.resource.data.subject_id, 40) && str(request.resource.data.section_id, 40)
+        && request.resource.data.teacher_id is string && request.resource.data.days is string
+        && request.resource.data.start_time is string && request.resource.data.end_time is string;
+      allow delete: if isAdmin();
+    }
+
+    // Students are records only (no login). Teachers: only students in their sections, no delete.
+    function validStudent() {
+      let d = request.resource.data;
+      return d.keys().hasOnly(['name', 'lrn', 'section_id', 'created_at'])
+        && str(d.name, 120) && d.lrn is string && d.lrn.size() <= 30 && d.section_id is string;
+    }
+    match /students/{id} {
+      allow get, list: if isAdmin() || (isTeacher() && resource.data.section_id in mine('section_ids'));
+      allow create: if validStudent() && (isAdmin() || (isTeacher() && request.resource.data.section_id in mine('section_ids')));
+      allow update: if validStudent() && (isAdmin() || (isTeacher()
+        && resource.data.section_id in mine('section_ids') && request.resource.data.section_id in mine('section_ids')));
+      allow delete: if isAdmin() || (isTeacher() && resource.data.section_id in mine('section_ids'));
+    }
+
+    // Attendance: one document per class + date + student. Teachers only for their own classes.
+    function validAtt(aid) {
+      let d = request.resource.data;
+      return d.keys().hasOnly(['class_id', 'student_id', 'date', 'month', 'status', 'marked_by', 'updated_at'])
+        && d.status in ['P', 'L', 'A', 'E']
+        && d.date.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}$') && d.month == d.date[0:7]
+        && d.marked_by == request.auth.uid
+        && aid == d.class_id + '_' + d.date + '_' + d.student_id;
+    }
+    match /attendance/{aid} {
+      allow get, list: if isAdmin() || (isTeacher() && resource.data.class_id in mine('class_ids'));
+      allow create, update: if validAtt(aid) && (isAdmin() || (isTeacher() && request.resource.data.class_id in mine('class_ids')));
+      allow delete: if isAdmin() || (isTeacher() && aid.split('_')[0] in mine('class_ids'));
+    }
+
+    // Reports teachers send to the admin (one per class per day). Admin can only mark them reviewed.
+    function validReport(rid) {
+      let d = request.resource.data;
+      return d.keys().hasOnly(['class_id', 'date', 'label', 'teacher_id', 'teacher_name', 'total', 'P', 'L', 'A', 'E', 'N', 'note', 'read', 'sent_at'])
+        && rid == d.class_id + '_' + d.date && d.date.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}$')
+        && d.label is string && d.label.size() <= 120 && d.note is string && d.note.size() <= 500
+        && d.total is int && d.P is int && d.L is int && d.A is int && d.E is int && d.N is int && d.read is bool;
+    }
+    match /reports/{rid} {
+      allow get, list: if isAdmin() || (isTeacher() && resource.data.teacher_id == request.auth.uid);
+      allow create, update: if isTeacher() && validReport(rid) && request.resource.data.teacher_id == request.auth.uid
+        && request.resource.data.class_id in mine('class_ids') && request.resource.data.read == false;
+      allow update: if isAdmin() && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['read']);
+      allow delete: if isAdmin();
+    }
+
+    // Settings: everyone signed in (and active) reads, only admin writes.
+    match /settings/{id} {
+      allow read: if active();
+      allow write: if isAdmin() && id == 'app';
+    }
+  }
+}
